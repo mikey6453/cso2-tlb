@@ -1,82 +1,97 @@
 #include "tlb.h"
-#include <stddef.h>
-#include <limits.h> // For INT_MAX
+#include <limits.h>
 
+#define SETS 16
+#define WAYS 4
+
+// Define the constant for an invalid address.
+#define INVALID_ADDRESS ((size_t)-1)
+
+// Define the cache line structure
 typedef struct {
-    size_t vpn;        // Virtual Page Number
-    size_t pa;         // Physical Address
-    int valid;         // Valid bit
-    int lru_counter;   // LRU counter, lower means more recently used
+    size_t vpn;       // Virtual Page Number
+    size_t pa;        // Physical Address
+    int valid;        // Valid bit
+    unsigned lru;     // LRU counter
 } TLBEntry;
 
-#define TLB_SETS 16
-#define TLB_WAYS 4
-TLBEntry tlb_cache[TLB_SETS][TLB_WAYS];
+// TLB structure: 16 sets, 4 ways each
+static TLBEntry tlb[SETS][WAYS];
 
+// Helper function to clear a single TLB entry
+void clear_tlb_entry(TLBEntry *entry) {
+    entry->vpn = 0;
+    entry->pa = 0;
+    entry->valid = 0;
+    entry->lru = UINT_MAX;
+}
+
+// Initialize or clear the TLB
 void tlb_clear() {
-    for (int i = 0; i < TLB_SETS; ++i) {
-        for (int j = 0; j < TLB_WAYS; ++j) {
-            tlb_cache[i][j].valid = 0;
-            tlb_cache[i][j].lru_counter = INT_MAX; // Reset LRU counters
+    for (int i = 0; i < SETS; ++i) {
+        for (int j = 0; j < WAYS; ++j) {
+            clear_tlb_entry(&tlb[i][j]);
         }
     }
 }
 
-void update_lru(int set_index, int accessed_way) {
-    int current_lru = tlb_cache[set_index][accessed_way].lru_counter;
-    for (int j = 0; j < TLB_WAYS; ++j) {
-        if (tlb_cache[set_index][j].valid && tlb_cache[set_index][j].lru_counter < current_lru) {
-            tlb_cache[set_index][j].lru_counter++;
+// Function to update the LRU counter
+void update_lru(int set, int way) {
+    unsigned min_lru = tlb[set][way].lru;
+    for (int w = 0; w < WAYS; ++w) {
+        if (tlb[set][w].lru < min_lru) {
+            tlb[set][w].lru++;
         }
     }
-    tlb_cache[set_index][accessed_way].lru_counter = 0;
+    tlb[set][way].lru = 0;
 }
 
-int get_set_index(size_t va) {
-    return (va >> POBITS) % TLB_SETS;
-}
-
+// Peek into the TLB to find LRU status
 int tlb_peek(size_t va) {
     size_t vpn = va >> POBITS;
-    int set_index = get_set_index(va);
+    int set = vpn % SETS;
 
-    for (int j = 0; j < TLB_WAYS; ++j) {
-        if (tlb_cache[set_index][j].valid && tlb_cache[set_index][j].vpn == vpn) {
-            return TLB_WAYS - tlb_cache[set_index][j].lru_counter;
+    for (int way = 0; way < WAYS; ++way) {
+        if (tlb[set][way].valid && tlb[set][way].vpn == vpn) {
+            return tlb[set][way].lru + 1;
         }
     }
     return 0;
 }
 
+// Translate a virtual address using the TLB
 size_t tlb_translate(size_t va) {
     size_t vpn = va >> POBITS;
+    int set = vpn % SETS;
     size_t page_offset = va & ((1 << POBITS) - 1);
-    int set_index = get_set_index(va);
-
-    for (int j = 0; j < TLB_WAYS; ++j) {
-        if (tlb_cache[set_index][j].valid && tlb_cache[set_index][j].vpn == vpn) {
-            update_lru(set_index, j);
-            return (tlb_cache[set_index][j].pa | page_offset);
+    
+    for (int way = 0; way < WAYS; ++way) {
+        if (tlb[set][way].valid && tlb[set][way].vpn == vpn) {
+            // Cache hit: update LRU and return PA
+            update_lru(set, way);
+            return (tlb[set][way].pa & ~((1 << POBITS) - 1)) | page_offset;
         }
     }
 
-    size_t new_pa = translate(va & ~((1 << POBITS) - 1));
-    if (new_pa == (size_t)-1) {
-        return (size_t)-1;
+    // Cache miss: translate and update TLB
+    size_t pa = translate(va & ~((1 << POBITS) - 1));
+    if (pa == INVALID_ADDRESS) {
+        return INVALID_ADDRESS;
     }
 
-    int lru_way = 0, max_lru = INT_MIN;
-    for (int j = 0; j < TLB_WAYS; ++j) {
-        if (tlb_cache[set_index][j].lru_counter > max_lru) {
-            lru_way = j;
-            max_lru = tlb_cache[set_index][j].lru_counter;
+    // Find least recently used line
+    int lru_way = 0;
+    for (int w = 1; w < WAYS; ++w) {
+        if (tlb[set][w].lru > tlb[set][lru_way].lru) {
+            lru_way = w;
         }
     }
 
-    tlb_cache[set_index][lru_way].vpn = vpn;
-    tlb_cache[set_index][lru_way].pa = new_pa;
-    tlb_cache[set_index][lru_way].valid = 1;
-    update_lru(set_index, lru_way);
+    // Update the LRU line with new data
+    tlb[set][lru_way].vpn = vpn;
+    tlb[set][lru_way].pa = pa;
+    tlb[set][lru_way].valid = 1;
+    update_lru(set, lru_way);
 
-    return new_pa | page_offset;
+    return (pa & ~((1 << POBITS) - 1)) | page_offset;
 }
